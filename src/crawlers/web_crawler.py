@@ -31,51 +31,50 @@ class DFSWebCrawler:
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(os.path.join(cache_dir, 'images'), exist_ok=True)
         
-        # Initialize SQLite cache
+        # Initialize SQLite cache with WAL mode for better performance
         self.init_db()
         
-        # Auto-detect optimal thread count based on CPU and memory
+        # Auto-detect optimal thread count based on CPU, memory, and network
         if max_threads is None:
             cpu_count = os.cpu_count()
             memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-            self.max_concurrent = min(int(cpu_count * 2), int(memory_gb * 2), 50)
+            # Increase concurrent tasks for better throughput
+            self.max_concurrent = min(int(cpu_count * 4), int(memory_gb * 4), 100)
         else:
             self.max_concurrent = max_threads
             
-        # Rate limiting per domain with adaptive delays
+        # Optimize domain rate limiting
         self.domain_locks = {}
         self.domain_lock_lock = threading.Lock()
         self.domain_stats = {}
         
-        # Metrics
-        self.metrics = {
-            'pages_crawled': 0,
-            'bytes_downloaded': 0,
-            'start_time': time.time(),
-            'successful_requests': 0,
-            'failed_requests': 0,
-            'cached_hits': 0
-        }
-        
-        # Content queues with size limits based on available memory
+        # Larger queues for better buffering
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-        self.text_queue = Queue(maxsize=int(1000 * memory_gb))
-        self.image_queue = Queue(maxsize=int(500 * memory_gb))
+        self.text_queue = Queue(maxsize=int(2000 * memory_gb))
+        self.image_queue = Queue(maxsize=int(1000 * memory_gb))
+        
+        # Batch processing settings
+        self.batch_size = 10
+        self.pending_urls = []
         
         # Load visited URLs from cache
         self.load_visited_urls()
         
-        logging.info(f"Initialized enhanced DFS crawler with {self.max_concurrent} concurrent tasks and caching")
+        logging.info(f"Initialized enhanced DFS crawler with {self.max_concurrent} concurrent tasks and optimized caching")
 
     def init_db(self):
-        """Initialize SQLite database for caching"""
+        """Initialize SQLite database with WAL mode for better performance"""
         self.db_path = os.path.join(self.cache_dir, 'crawler_cache.db')
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=10000")
             c = conn.cursor()
             c.execute('''CREATE TABLE IF NOT EXISTS pages
                         (url TEXT PRIMARY KEY, content TEXT, last_crawled TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS visited_urls
                         (url TEXT PRIMARY KEY, timestamp TIMESTAMP)''')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_last_crawled ON pages(last_crawled)')
             conn.commit()
 
     def load_visited_urls(self):
@@ -94,7 +93,7 @@ class DFSWebCrawler:
                      (url, datetime.now()))
             conn.commit()
 
-    def get_cached_page(self, url):
+    def get_cached_page(self, url, max_age_hours=24):
         """Get page from cache if it exists and is not too old"""
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
@@ -102,9 +101,8 @@ class DFSWebCrawler:
             result = c.fetchone()
             if result:
                 content, last_crawled = result
-                # Check if cache is less than 24 hours old
-                if datetime.now() - datetime.fromisoformat(last_crawled) < timedelta(hours=24):
-                    self.metrics['cached_hits'] += 1
+                # Check if cache is less than max_age_hours old
+                if datetime.now() - datetime.fromisoformat(last_crawled) < timedelta(hours=max_age_hours):
                     return content
         return None
 
@@ -117,15 +115,13 @@ class DFSWebCrawler:
             conn.commit()
 
     def get_adaptive_delay(self, domain):
-        """Get adaptive delay based on domain response times and errors"""
+        """Get adaptive delay with more aggressive settings"""
         stats = self.domain_stats.get(domain, {'errors': 0, 'success': 0})
-        base_delay = 1.0
+        base_delay = 0.5  # Reduced base delay
         
-        # Increase delay if there are errors
-        error_factor = 1 + (stats['errors'] * 0.5)
-        
-        # Decrease delay for successful requests
-        success_factor = max(0.5, 1 - (stats['success'] * 0.1))
+        # More aggressive delay adjustment
+        error_factor = 1 + (stats['errors'] * 0.25)  # Reduced penalty
+        success_factor = max(0.2, 1 - (stats['success'] * 0.2))  # More reduction for success
         
         return base_delay * error_factor * success_factor
 
@@ -138,7 +134,6 @@ class DFSWebCrawler:
             
             # Check cache first
             if os.path.exists(cache_path):
-                self.metrics['cached_hits'] += 1
                 return Image.open(cache_path).convert('RGB')
             
             async with session.get(img_url, timeout=30) as response:
@@ -155,7 +150,7 @@ class DFSWebCrawler:
             return None
 
     async def crawl_url_dfs(self, url, depth=0):
-        """Crawl a single URL and its links"""
+        """Optimized crawling function"""
         if not self.is_running or depth > self.max_depth or url in self.visited:
             return
 
@@ -169,20 +164,21 @@ class DFSWebCrawler:
                         return
                     self.visited.add(url)
                     self.save_visited_url(url)
-                    logging.info(f"Crawling URL: {url} at depth {depth}")
 
-                # Check cache first
-                cached_content = self.get_cached_page(url)
+                # Check cache with shorter expiry
+                cached_content = self.get_cached_page(url, max_age_hours=12)
                 if cached_content:
                     self.process_cached_content(url, cached_content, depth)
                     return
 
-                # Adaptive delay based on domain stats
+                # Reduced delay
                 delay = self.get_adaptive_delay(domain)
                 await asyncio.sleep(delay)
 
-                timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Optimized network settings
+                timeout = aiohttp.ClientTimeout(total=20, connect=5)
+                connector = aiohttp.TCPConnector(limit_per_host=10)
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                     try:
                         async with session.get(url, headers={
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -197,39 +193,21 @@ class DFSWebCrawler:
                             if 'text/html' not in content_type:
                                 return
 
-                            try:
-                                content = await response.text()
-                            except UnicodeDecodeError:
-                                content = await response.read()
-                                content = content.decode('utf-8', errors='ignore')
-                            
+                            content = await response.text()
                             self.metrics['bytes_downloaded'] += len(content)
                             self.metrics['pages_crawled'] += 1
                             self.update_domain_stats(domain, success=True)
 
+                            # Batch process content
+                            soup = BeautifulSoup(content, 'html.parser')
+                            await asyncio.gather(
+                                self.process_text(url, soup, depth),
+                                self.process_images(session, soup, url, depth),
+                                self.process_links(soup, url, depth)
+                            )
+
                             # Cache the content
                             self.cache_page(url, content)
-
-                            soup = BeautifulSoup(content, 'html.parser')
-                            
-                            # Process current page content first
-                            text = self.extract_text(soup)
-                            if text and len(text.split()) > 50:
-                                if not self.text_queue.full():
-                                    self.text_queue.put({'url': url, 'text': text, 'depth': depth})
-                                    logging.info(f"Added text from {url} to queue. Queue size: {self.text_queue.qsize()}")
-
-                            # Process images
-                            await self.process_images(session, soup, url, depth)
-                            
-                            # Extract and schedule new links
-                            if depth < self.max_depth:
-                                links = self.extract_links(soup, url)
-                                for link in links:
-                                    if len(self.tasks) < self.max_concurrent and self.is_running:
-                                        task = asyncio.create_task(self.crawl_url_dfs(link, depth + 1))
-                                        self.tasks.add(task)
-                                        task.add_done_callback(self.tasks.discard)
 
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                         self.update_domain_stats(domain, success=False)
@@ -237,6 +215,13 @@ class DFSWebCrawler:
 
             except Exception as e:
                 logging.error(f"Error crawling {url}: {e}")
+
+    async def process_text(self, url, soup, depth):
+        """Process text content asynchronously"""
+        text = self.extract_text(soup)
+        if text and len(text.split()) > 50:
+            if not self.text_queue.full():
+                self.text_queue.put({'url': url, 'text': text, 'depth': depth})
 
     async def process_images(self, session, soup, base_url, depth):
         """Process images from a page"""
@@ -254,7 +239,16 @@ class DFSWebCrawler:
                         'image': processed_image,
                         'depth': depth
                     })
-                    logging.info(f"Added image from {img_url} to queue. Queue size: {self.image_queue.qsize()}")
+
+    async def process_links(self, soup, base_url, depth):
+        """Process and schedule links asynchronously"""
+        if depth < self.max_depth:
+            links = self.extract_links(soup, base_url)
+            for link in links[:50]:  # Limit to top 50 links per page
+                if len(self.tasks) < self.max_concurrent and self.is_running:
+                    task = asyncio.create_task(self.crawl_url_dfs(link, depth + 1))
+                    self.tasks.add(task)
+                    task.add_done_callback(self.tasks.discard)
 
     def extract_links(self, soup, base_url):
         """Extract and filter links from a page"""
@@ -413,7 +407,6 @@ class DFSWebCrawler:
             if text and len(text.split()) > 50:
                 if not self.text_queue.full():
                     self.text_queue.put({'url': url, 'text': text, 'depth': depth})
-                    logging.info(f"Added cached text from {url} to queue")
         except Exception as e:
             logging.error(f"Error processing cached content from {url}: {e}")
 

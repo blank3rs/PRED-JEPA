@@ -335,24 +335,30 @@ def save_best_model(model_dir, epoch, model, optimizer, train_loss, val_loss, be
     logging.info(f"Saved best model with validation loss {val_loss:.4f}")
 
 def main():
-    # Check CUDA availability
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    distributed = False  # Only enable distributed if CUDA is available
-    local_rank = 0
+    # Optimize CUDA settings for RTX 4070
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training
+        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
+        torch.backends.cudnn.deterministic = False  # Disable deterministic mode for speed
+        device = torch.device('cuda')
+        torch.cuda.set_device(0)  # Explicitly set to first GPU
+        
+        # Print GPU info
+        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        device = torch.device('cpu')
+        logging.warning("CUDA not available, using CPU")
     
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        distributed = True
-        torch.distributed.init_process_group(backend='nccl')
-        local_rank = torch.distributed.get_rank()
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f'cuda:{local_rank}')
+    distributed = False  # Only enable distributed if multiple GPUs
+    local_rank = 0
     
     logging.info(f"Using device: {device} (Distributed: {distributed})")
     
     # Initialize configuration
     model_config = ModelConfig()
     
-    # Initialize model
+    # Initialize model with optimized settings
     model = JEPAModel(
         image_size=224,
         patch_size=model_config.patch_size,
@@ -365,9 +371,19 @@ def main():
     if distributed:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
-    # Initialize optimizer with lower learning rate for CPU
-    lr = 1e-4 if torch.cuda.is_available() else 5e-5
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # Optimize learning rate and optimizer settings for RTX 4070
+    if torch.cuda.is_available():
+        lr = 2e-4  # Higher learning rate for GPU
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+    else:
+        lr = 5e-5  # Lower learning rate for CPU
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     # Create stop event for graceful shutdown
     stop_event = threading.Event()

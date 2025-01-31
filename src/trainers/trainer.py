@@ -22,13 +22,26 @@ class UnifiedTrainer:
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.device = device
-        self.distributed = distributed
+        
+        # Properly handle device selection
+        self.device = torch.device('cuda' if torch.cuda.is_available() and device == 'cuda' else 'cpu')
+        if self.device.type == 'cpu' and device == 'cuda':
+            logging.warning("CUDA requested but not available, falling back to CPU")
+        
+        self.distributed = distributed and self.device.type == 'cuda'
         self.local_rank = local_rank
-        self.scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
+        
+        # Move model to device
+        self.model = self.model.to(self.device)
+        
+        # Initialize scaler based on device
+        if self.device.type == 'cuda':
+            self.scaler = torch.amp.GradScaler()
+        else:
+            self.scaler = None
         
         # Initialize distributed training if needed
-        if distributed:
+        if self.distributed:
             self.model = DistributedDataParallel(
                 model,
                 device_ids=[local_rank],
@@ -110,29 +123,47 @@ class UnifiedTrainer:
         num_batches = len(train_loader)
         
         for batch_idx, batch in enumerate(train_loader):
-            # Move data to device
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                    for k, v in batch.items()}
-            
             try:
-                with autocast():
-                    outputs = self.model(batch, task=task)
-                    loss, loss_dict = self.compute_loss(outputs, batch, task)
+                # Move data to device and handle potential errors
+                processed_batch = {}
+                for k, v in batch.items():
+                    try:
+                        if torch.is_tensor(v):
+                            processed_batch[k] = v.to(self.device)
+                        else:
+                            processed_batch[k] = v
+                    except Exception as e:
+                        logging.error(f"Error moving tensor {k} to device: {e}")
+                        continue
                 
-                # Backward pass with gradient scaling
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                
-                # Clip gradients
-                if self.distributed:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), 1.0)
+                # Forward pass with appropriate autocast
+                if self.device.type == 'cuda':
+                    with autocast():
+                        outputs = self.model(processed_batch, task=task)
+                        loss, loss_dict = self.compute_loss(outputs, processed_batch, task)
                 else:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    outputs = self.model(processed_batch, task=task)
+                    loss, loss_dict = self.compute_loss(outputs, processed_batch, task)
                 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # Backward pass with appropriate scaling
+                self.optimizer.zero_grad()
+                
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.module.parameters() if self.distributed else self.model.parameters(),
+                        1.0
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.module.parameters() if self.distributed else self.model.parameters(),
+                        1.0
+                    )
+                    self.optimizer.step()
                 
                 if self.scheduler is not None:
                     self.scheduler.step()
@@ -153,10 +184,10 @@ class UnifiedTrainer:
                     self.metrics['learning_rates'].append(lr)
                 
             except Exception as e:
-                logging.error(f"Error in training batch: {e}")
+                logging.error(f"Error in training batch {batch_idx}: {e}")
                 continue
         
-        return total_loss / num_batches
+        return total_loss / num_batches if num_batches > 0 else float('inf')
     
     @torch.no_grad()
     def validate(self, val_loader, task: str = 'pretrain'):
