@@ -193,3 +193,5 @@ secrets/
 .secrets/
 .aws/
 .ssh/
+*.crawler_cache
+jepa.log

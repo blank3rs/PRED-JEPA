@@ -20,8 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('jepa.log'),
-        logging.StreamHandler()
+        logging.FileHandler('jepa.log')
     ]
 )
 
@@ -37,18 +36,49 @@ def chat_worker(model, device, stop_event):
     """Worker function for chat interface"""
     chat_interface = ChatInterface(model, device=device)
     
+    # Configure logging for chat interface
+    chat_logger = logging.getLogger('chat')
+    chat_logger.setLevel(logging.INFO)
+    chat_handler = logging.FileHandler('chat.log')
+    chat_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    chat_logger.addHandler(chat_handler)
+    chat_logger.propagate = False  # Prevent propagation to root logger
+    
     print("\nChat interface is ready! Type 'quit' to exit.")
+    print("Type 'clear' to clear the screen.")
+    print("Type 'help' for commands.\n")
+    
     while not stop_event.is_set():
         try:
-            user_input = input("\nYou: ")
+            # Clear line and show prompt
+            print("\rYou: ", end='', flush=True)
+            user_input = input()
+            
             if user_input.lower() == 'quit':
                 break
+            elif user_input.lower() == 'clear':
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
+            elif user_input.lower() == 'help':
+                print("\nAvailable commands:")
+                print("  quit  - Exit the chat interface")
+                print("  clear - Clear the screen")
+                print("  help  - Show this help message\n")
+                continue
             
+            # Process input and get response
             response = chat_interface.process_query(user_input)
-            print(f"Assistant: {response}")
+            
+            # Log to file only, not console
+            chat_logger.info(f"User: {user_input}")
+            chat_logger.info(f"Assistant: {response}")
+            
+            # Print response to console
+            print(f"\nAssistant: {response}\n")
             
         except Exception as e:
-            logging.error(f"Error in chat interface: {e}")
+            chat_logger.error(f"Error in chat interface: {e}")
+            print(f"\nError: {e}\n")
             continue
 
 def training_worker(model, optimizer, device, distributed, local_rank, stop_event):
@@ -335,6 +365,23 @@ def save_best_model(model_dir, epoch, model, optimizer, train_loss, val_loss, be
     logging.info(f"Saved best model with validation loss {val_loss:.4f}")
 
 def main():
+    # Configure main logging (file only)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('jepa.log')
+        ]
+    )
+    
+    # Separate logger for training metrics (file only)
+    train_logger = logging.getLogger('training')
+    train_logger.setLevel(logging.INFO)
+    train_handler = logging.FileHandler('training.log')
+    train_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    train_logger.addHandler(train_handler)
+    train_logger.propagate = False  # Prevent propagation to root logger
+    
     # Optimize CUDA settings for RTX 4070
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training

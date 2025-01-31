@@ -31,15 +31,21 @@ class DFSWebCrawler:
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(os.path.join(cache_dir, 'images'), exist_ok=True)
         
-        # Initialize SQLite cache with WAL mode for better performance
+        # Initialize SQLite cache with optimized settings
         self.init_db()
         
-        # Auto-detect optimal thread count based on CPU, memory, and network
+        # Auto-detect optimal thread count based on system resources
         if max_threads is None:
             cpu_count = os.cpu_count()
             memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-            # Increase concurrent tasks for better throughput
-            self.max_concurrent = min(int(cpu_count * 4), int(memory_gb * 4), 100)
+            network_bandwidth = 50  # Assume 50 Mbps as baseline
+            # Calculate optimal concurrent tasks based on resources
+            self.max_concurrent = min(
+                int(cpu_count * 6),  # More aggressive CPU utilization
+                int(memory_gb * 5),  # More memory per task
+                int(network_bandwidth * 2),  # Better bandwidth utilization
+                150  # Hard cap at 150 tasks
+            )
         else:
             self.max_concurrent = max_threads
             
@@ -50,25 +56,38 @@ class DFSWebCrawler:
         
         # Larger queues for better buffering
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-        self.text_queue = Queue(maxsize=int(2000 * memory_gb))
-        self.image_queue = Queue(maxsize=int(1000 * memory_gb))
+        self.text_queue = Queue(maxsize=int(5000 * memory_gb))  # Increased queue sizes
+        self.image_queue = Queue(maxsize=int(2000 * memory_gb))
         
-        # Batch processing settings
-        self.batch_size = 10
+        # Enhanced batch processing settings
+        self.batch_size = 20  # Increased batch size
         self.pending_urls = []
+        self.processing_timeout = 30  # 30 second timeout for processing
+        
+        # Metrics initialization
+        self.metrics = {
+            'start_time': time.time(),
+            'pages_crawled': 0,
+            'bytes_downloaded': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'cached_hits': 0
+        }
         
         # Load visited URLs from cache
         self.load_visited_urls()
         
-        logging.info(f"Initialized enhanced DFS crawler with {self.max_concurrent} concurrent tasks and optimized caching")
+        logging.info(f"Initialized enhanced DFS crawler with {self.max_concurrent} concurrent tasks and optimized settings")
 
     def init_db(self):
-        """Initialize SQLite database with WAL mode for better performance"""
+        """Initialize SQLite database with optimized settings"""
         self.db_path = os.path.join(self.cache_dir, 'crawler_cache.db')
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=10000")
+            conn.execute("PRAGMA cache_size=50000")  # Increased cache size
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA mmap_size=30000000000")  # 30GB mmap
             c = conn.cursor()
             c.execute('''CREATE TABLE IF NOT EXISTS pages
                         (url TEXT PRIMARY KEY, content TEXT, last_crawled TIMESTAMP)''')
@@ -115,18 +134,28 @@ class DFSWebCrawler:
             conn.commit()
 
     def get_adaptive_delay(self, domain):
-        """Get adaptive delay with more aggressive settings"""
+        """Get adaptive delay with optimized settings"""
         stats = self.domain_stats.get(domain, {'errors': 0, 'success': 0})
-        base_delay = 0.5  # Reduced base delay
+        base_delay = 0.2  # Reduced base delay
         
         # More aggressive delay adjustment
-        error_factor = 1 + (stats['errors'] * 0.25)  # Reduced penalty
-        success_factor = max(0.2, 1 - (stats['success'] * 0.2))  # More reduction for success
+        error_factor = 1 + (stats['errors'] * 0.2)  # Reduced penalty
+        success_factor = max(0.1, 1 - (stats['success'] * 0.25))  # More reduction for success
         
         return base_delay * error_factor * success_factor
 
+    def delete_cached_image(self, img_url):
+        """Delete cached image file"""
+        try:
+            img_hash = hashlib.md5(img_url.encode()).hexdigest()
+            cache_path = os.path.join(self.cache_dir, 'images', f'{img_hash}.jpg')
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+        except Exception as e:
+            logging.error(f"Error deleting cached image {img_url}: {e}")
+
     async def process_image(self, session, img_url):
-        """Process and cache images"""
+        """Process and cache images with cleanup"""
         try:
             # Generate cache path
             img_hash = hashlib.md5(img_url.encode()).hexdigest()
@@ -134,23 +163,30 @@ class DFSWebCrawler:
             
             # Check cache first
             if os.path.exists(cache_path):
-                return Image.open(cache_path).convert('RGB')
+                image = Image.open(cache_path).convert('RGB')
+                # Delete the cached image after loading
+                self.delete_cached_image(img_url)
+                return image
             
             async with session.get(img_url, timeout=30) as response:
                 if response.status == 200:
                     content = await response.read()
                     image = Image.open(io.BytesIO(content)).convert('RGB')
                     
-                    # Cache the image
+                    # Cache temporarily and then delete after processing
                     image.save(cache_path, 'JPEG', quality=85)
-                    return image
+                    processed_image = Image.open(cache_path).convert('RGB')
+                    self.delete_cached_image(img_url)
+                    return processed_image
                     
         except Exception as e:
             logging.error(f"Error processing image {img_url}: {e}")
+            # Clean up any failed cached image
+            self.delete_cached_image(img_url)
             return None
 
     async def crawl_url_dfs(self, url, depth=0):
-        """Optimized crawling function"""
+        """Optimized crawling function with cleanup"""
         if not self.is_running or depth > self.max_depth or url in self.visited:
             return
 
@@ -198,7 +234,7 @@ class DFSWebCrawler:
                             self.metrics['pages_crawled'] += 1
                             self.update_domain_stats(domain, success=True)
 
-                            # Batch process content
+                            # Process content immediately
                             soup = BeautifulSoup(content, 'html.parser')
                             await asyncio.gather(
                                 self.process_text(url, soup, depth),
@@ -206,8 +242,8 @@ class DFSWebCrawler:
                                 self.process_links(soup, url, depth)
                             )
 
-                            # Cache the content
-                            self.cache_page(url, content)
+                            # Delete the URL from visited_urls after processing
+                            self.delete_visited_url(url)
 
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                         self.update_domain_stats(domain, success=False)
@@ -224,7 +260,7 @@ class DFSWebCrawler:
                 self.text_queue.put({'url': url, 'text': text, 'depth': depth})
 
     async def process_images(self, session, soup, base_url, depth):
-        """Process images from a page"""
+        """Process images from a page with immediate cleanup"""
         for img in soup.find_all('img'):
             if not self.is_running:
                 return
@@ -239,6 +275,8 @@ class DFSWebCrawler:
                         'image': processed_image,
                         'depth': depth
                     })
+                    # Clean up the processed image from memory
+                    processed_image.close()
 
     async def process_links(self, soup, base_url, depth):
         """Process and schedule links asynchronously"""
@@ -399,14 +437,38 @@ class DFSWebCrawler:
         skip_domains = {'facebook.com', 'twitter.com', 'instagram.com', 'ads.', 'analytics.', 'tracker.'}
         return not any(domain in parsed.netloc for domain in skip_domains)
 
+    def delete_cached_page(self, url):
+        """Delete a page from cache after processing"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                c = conn.cursor()
+                c.execute('DELETE FROM pages WHERE url = ?', (url,))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error deleting cached page {url}: {e}")
+
+    def delete_visited_url(self, url):
+        """Delete a visited URL from cache"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                c = conn.cursor()
+                c.execute('DELETE FROM visited_urls WHERE url = ?', (url,))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error deleting visited URL {url}: {e}")
+
     def process_cached_content(self, url, content, depth):
-        """Process content from cache"""
+        """Process content from cache and delete after processing"""
         try:
             soup = BeautifulSoup(content, 'html.parser')
             text = self.extract_text(soup)
             if text and len(text.split()) > 50:
                 if not self.text_queue.full():
                     self.text_queue.put({'url': url, 'text': text, 'depth': depth})
+            
+            # Delete the processed page from cache
+            self.delete_cached_page(url)
+            
         except Exception as e:
             logging.error(f"Error processing cached content from {url}: {e}")
 
