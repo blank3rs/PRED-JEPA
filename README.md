@@ -157,5 +157,3 @@ If you use this implementation in your research, please cite:
 - **Issues**: Please use the GitHub issues tab
 - **Email**: akku41809@gmail.com
 
----
-Made with ❤️ by blank3rs 
