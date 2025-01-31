@@ -60,8 +60,17 @@ class ChatInterface:
             try:
                 with torch.no_grad():
                     outputs = self.model(image, inputs['input_ids'])
-                    transformer_outputs = outputs['transformer_outputs']
-                    logits = transformer_outputs['text_pred']
+                    # Ensure we extract transformer outputs properly
+                    if isinstance(outputs, dict):
+                        transformer_outputs = outputs.get('transformer_outputs', {})
+                    else:
+                        # Handle legacy tuple format temporarily
+                        transformer_outputs = outputs[0] if isinstance(outputs, tuple) else {}
+                    
+                    logits = transformer_outputs.get('text_pred', None)
+                    
+                    if logits is None:
+                        raise ValueError("Text predictions missing")
                     
             except Exception as e:
                 logging.error(f"Model forward pass error: {str(e)}")
@@ -88,8 +97,17 @@ class ChatInterface:
                     
                     # Get next prediction
                     outputs = self.model(image, new_input)
-                    transformer_outputs = outputs['transformer_outputs']
-                    logits = transformer_outputs['text_pred']
+                    
+                    # Handle different output formats
+                    if isinstance(outputs, dict):
+                        transformer_outputs = outputs.get('transformer_outputs', {})
+                    else:
+                        transformer_outputs = outputs[0] if isinstance(outputs, tuple) else {}
+                    
+                    logits = transformer_outputs.get('text_pred', None)
+                    
+                    if logits is None:
+                        raise ValueError("Text predictions missing")
                     
                     if new_input.size(1) >= self.max_length:
                         break
