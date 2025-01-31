@@ -41,83 +41,82 @@ class ChatInterface:
         try:
             logging.info(f"Processing user input: {user_input}")
             
-            # Check if model has been trained
-            if not hasattr(self.model, 'transformer') or not hasattr(self.model.transformer, 'text_head'):
-                return "I need to be trained before I can respond to messages. Please run the training process first."
-            
-            # Tokenize input with special tokens
+            # Tokenize input
             inputs = self.tokenizer(
                 user_input,
                 return_tensors='pt',
-                max_length=self.max_length // 2,  # Leave room for response
+                max_length=self.max_length // 2,
                 truncation=True,
-                padding=False  # Don't pad yet
+                padding=False
             ).to(self.device)
             
             # Create empty image tensor if no image provided
             if image is None:
                 image = torch.zeros((1, 3, 224, 224), device=self.device)
-                logging.info("Created empty image tensor")
             elif not isinstance(image, torch.Tensor):
                 raise ValueError("Image must be a torch tensor")
             
-            # Generate response token by token
-            response_ids = []
-            current_ids = inputs['input_ids']
-            current_mask = inputs['attention_mask']
-            
-            for _ in range(50):  # Maximum 50 new tokens
-                # Prepare batch
-                batch = {
-                    'text_ids': current_ids,
-                    'text_mask': current_mask,
-                    'image': image.to(self.device) if image is not None else None
-                }
-                
-                # Generate next token
+            # Generate response
+            try:
                 with torch.no_grad():
-                    outputs = self.model(batch, task='generate')
-                    if 'transformer_outputs' not in outputs or 'text_pred' not in outputs['transformer_outputs']:
-                        break
-                        
-                    logits = outputs['transformer_outputs']['text_pred']
-                    if logits is None or logits.size(0) == 0:
-                        break
+                    outputs = self.model(image, inputs['input_ids'])
+                    transformer_outputs = outputs['transformer_outputs']
+                    logits = transformer_outputs['text_pred']
                     
-                    # Get the last token's prediction
+            except Exception as e:
+                logging.error(f"Model forward pass error: {str(e)}")
+                logging.error(f"Full traceback: {traceback.format_exc()}")
+                return f"Error during model inference: {str(e)}"
+            
+            # Generate response token by token
+            try:
+                response_ids = []
+                temperature = 0.7
+                
+                for _ in range(50):
                     last_token_logits = logits[:, -1, :]
-                    
-                    # Apply temperature sampling
-                    temperature = 0.7
                     probs = F.softmax(last_token_logits / temperature, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                     
-                    # Stop if we predict an end token
                     if next_token.item() in [self.tokenizer.sep_token_id, self.tokenizer.pad_token_id]:
                         break
                         
-                    # Add to response
                     response_ids.append(next_token.item())
                     
-                    # Update current input
-                    current_ids = torch.cat([current_ids, next_token], dim=1)
-                    current_mask = torch.ones_like(current_ids)
+                    # Update input for next iteration
+                    new_input = torch.cat([inputs['input_ids'], next_token], dim=1)
                     
-                    # Stop if getting too long
-                    if current_ids.size(1) >= self.max_length:
+                    # Get next prediction
+                    outputs = self.model(image, new_input)
+                    transformer_outputs = outputs['transformer_outputs']
+                    logits = transformer_outputs['text_pred']
+                    
+                    if new_input.size(1) >= self.max_length:
                         break
+                        
+            except Exception as e:
+                logging.error(f"Response generation error: {str(e)}")
+                logging.error(f"Full traceback: {traceback.format_exc()}")
+                return f"Error during response generation: {str(e)}"
             
-            # Decode the response
-            if response_ids:
-                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                if len(response_text.strip()) < 2:  # If response too short, try again with higher temperature
-                    temperature = 1.0
-                    probs = F.softmax(last_token_logits / temperature, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    response_text = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
-            else:
-                response_text = "I'm not sure how to respond to that."
+            # Decode response
+            try:
+                if response_ids:
+                    response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                    if len(response_text.strip()) < 2:
+                        temperature = 1.0
+                        probs = F.softmax(last_token_logits / temperature, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                        response_text = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
+                else:
+                    response_text = "I'm not sure how to respond to that."
+                    
+                logging.info(f"Generated response: {response_text}")
                 
+            except Exception as e:
+                logging.error(f"Response decoding error: {str(e)}")
+                return f"Error during response decoding: {str(e)}"
+            
             # Update conversation history
             self.conversation_history.append({
                 'user': user_input,
@@ -127,9 +126,9 @@ class ChatInterface:
             return response_text
             
         except Exception as e:
-            logging.error(f"Error generating response: {str(e)}")
-            logging.error(f"Error traceback: {traceback.format_exc()}")
-            return "I encountered an error while processing your request."
+            logging.error(f"Unexpected error in process_query: {str(e)}")
+            logging.error(f"Full traceback: {traceback.format_exc()}")
+            return f"Unexpected error: {str(e)}"
     
     def save_conversation_history(self, path: str):
         try:
