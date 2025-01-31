@@ -1,0 +1,195 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# IDE - PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# IDE - Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+*.sqlite3
+*.rdb
+*.pdb
+dump.rdb
+*.bak.*
+*.backup.*
+*_backup.*
+dump/
+backups/
+*.dump
+*.sql
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.coverage
+.tox/
+.pytest_cache/
+htmlcov/
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+nosetests.xml
+
+# Distribution / packaging
+.Python
+*.manifest
+*.spec
+.python-version
+dist/
+build/
+eggs/
+parts/
+bin/
+var/
+sdist/
+develop-eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Misc
+*.bak
+*.swp
+*.swo
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.retry
+*.pid
+*.seed
+*.pid.lock
+*.tgz
+
+# Project specific
+data/
+models/
+outputs/
+results/
+logs/
+tmp/
+temp/
+cache/
+.cache/
+artifacts/
+checkpoints/
+runs/
+wandb/
+mlruns/
+tensorboard/
+saved_models/
+
+# Large media files
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
+*.mp3
+*.wav
+*.flac
+*.tar.gz
+*.zip
+*.7z
+*.rar
+*.iso
+*.gz
+*.bz2
+
+# Documentation
+docs/_build/
+docs/_static/
+docs/_templates/
+site/
+
+# Docker
+.docker/
+docker-compose.override.yml
+*.env.docker
+
+# Dependencies
+node_modules/
+bower_components/
+jspm_packages/
+web_modules/
+
+# Local development
+*.local
+local_settings.py
+instance/
+.webassets-cache/
+
+# Profiling data
+*.prof
+*.lprof
+*.stats
+profile_results/
+
+# Security
+*.pem
+*.key
+*.cert
+*.crt
+*.csr
+*.p12
+*.pfx
+credentials/
+secrets/
+.secrets/
+.aws/
+.ssh/

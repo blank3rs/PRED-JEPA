@@ -1,0 +1,32 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="jepa",
+    version="0.1.0",
+    packages=find_packages(),
+    install_requires=[
+        'torch>=2.0.0',
+        'torchvision>=0.15.0',
+        'transformers>=4.30.0',
+        'einops>=0.6.0',
+        'numpy>=1.24.0',
+        'Pillow>=9.5.0',
+        'beautifulsoup4>=4.12.0',
+        'aiohttp>=3.8.0',
+        'psutil>=5.9.0',
+        'faiss-cpu>=1.7.0',
+        'yt-dlp>=2023.3.4',
+        'arxiv>=1.4.0',
+        'requests>=2.31.0',
+        'tqdm>=4.65.0',
+        'python-dotenv>=1.0.0',
+        'lxml>=4.9.0',
+        'aiofiles>=23.1.0',
+        'tenacity>=8.2.0',
+        'scikit-learn>=1.3.0',
+        'pandas>=2.0.0',
+        'matplotlib>=3.7.0',
+        'wandb>=0.15.0'
+    ],
+    python_requires='>=3.8',
+) 
