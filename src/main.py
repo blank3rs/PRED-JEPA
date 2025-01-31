@@ -374,38 +374,19 @@ def main():
         ]
     )
     
-    # Separate logger for training metrics (file only)
-    train_logger = logging.getLogger('training')
-    train_logger.setLevel(logging.INFO)
-    train_handler = logging.FileHandler('training.log')
-    train_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    train_logger.addHandler(train_handler)
-    train_logger.propagate = False  # Prevent propagation to root logger
-    
-    # Optimize CUDA settings for RTX 4070
+    # Set up device
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training
-        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-        torch.backends.cudnn.deterministic = False  # Disable deterministic mode for speed
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
         device = torch.device('cuda')
-        torch.cuda.set_device(0)  # Explicitly set to first GPU
-        
-        # Print GPU info
+        torch.cuda.set_device(0)
         logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     else:
         device = torch.device('cpu')
         logging.warning("CUDA not available, using CPU")
     
-    distributed = False  # Only enable distributed if multiple GPUs
-    local_rank = 0
-    
-    logging.info(f"Using device: {device} (Distributed: {distributed})")
-    
-    # Initialize configuration
+    # Initialize model
     model_config = ModelConfig()
-    
-    # Initialize model with optimized settings
     model = JEPAModel(
         image_size=224,
         patch_size=model_config.patch_size,
@@ -415,58 +396,42 @@ def main():
         memory_size=model_config.memory_size
     ).to(device)
     
-    if distributed:
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+    # Load pre-trained weights if available
+    checkpoint_dir = './checkpoints'
+    if os.path.exists(checkpoint_dir):
+        checkpoint_files = sorted(os.listdir(checkpoint_dir))
+        if checkpoint_files:
+            latest_checkpoint = os.path.join(checkpoint_dir, checkpoint_files[-1])
+            logging.info(f"Loading checkpoint: {latest_checkpoint}")
+            try:
+                checkpoint = torch.load(latest_checkpoint, map_location=device)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logging.info("Successfully loaded pre-trained weights")
+            except Exception as e:
+                logging.error(f"Error loading checkpoint: {e}")
+                logging.info("Starting with randomly initialized weights")
     
-    # Optimize learning rate and optimizer settings for RTX 4070
-    if torch.cuda.is_available():
-        lr = 2e-4  # Higher learning rate for GPU
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=lr,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-    else:
-        lr = 5e-5  # Lower learning rate for CPU
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # Initialize optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
     
     # Create stop event for graceful shutdown
     stop_event = threading.Event()
     
     try:
-        # Start training thread
-        training_thread = threading.Thread(
-            target=training_worker,
-            args=(model, optimizer, device, distributed, local_rank, stop_event)
-        )
-        training_thread.start()
-        
-        # Start chat interface thread
-        chat_thread = threading.Thread(
-            target=chat_worker,
-            args=(model, device, stop_event)
-        )
-        chat_thread.start()
-        
-        # Wait for threads to complete
-        training_thread.join()
-        chat_thread.join()
-    
+        # Start chat interface in main thread
+        chat_worker(model, device, stop_event)
     except KeyboardInterrupt:
-        logging.info("Received interrupt, shutting down gracefully...")
+        logging.info("Received keyboard interrupt, stopping...")
         stop_event.set()
-        
-        # Wait for threads to complete
-        training_thread.join()
-        chat_thread.join()
-    
     finally:
-        # Clean up
-        if distributed:
-            torch.distributed.destroy_process_group()
-        logging.info("Training and chat interface stopped")
+        stop_event.set()
+        logging.info("Cleanup complete")
 
 if __name__ == "__main__":
     main() 
