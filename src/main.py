@@ -53,6 +53,7 @@ def chat_worker(model, device, stop_event):
 
 def training_worker(model, optimizer, device, distributed, local_rank, stop_event):
     """Worker function for training loop"""
+    crawler = None
     try:
         # Initialize data processor and crawler
         data_processor = DataProcessor()
@@ -76,10 +77,15 @@ def training_worker(model, optimizer, device, distributed, local_rank, stop_even
                 checkpoint = torch.load(latest_checkpoint, map_location=device)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                start_epoch = checkpoint['epoch']
-                best_val_loss = checkpoint['best_val_loss']
-                crawler.visited = set(checkpoint.get('visited_urls', []))
-                logging.info(f"Resumed from epoch {start_epoch} with validation loss {best_val_loss}")
+                # Only resume from checkpoint if we haven't completed all epochs
+                if checkpoint['epoch'] < 30:  # num_epochs
+                    start_epoch = checkpoint['epoch']
+                    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                    if 'visited_urls' in checkpoint:
+                        crawler.visited = set(checkpoint['visited_urls'])
+                    logging.info(f"Resumed from epoch {start_epoch} with validation loss {best_val_loss}")
+                else:
+                    logging.info("Starting fresh training run (previous run completed)")
             except Exception as e:
                 logging.error(f"Error loading checkpoint: {e}")
                 logging.info("Starting from scratch")
@@ -87,6 +93,9 @@ def training_worker(model, optimizer, device, distributed, local_rank, stop_even
         # Start crawling in background
         logging.info("Starting crawler in training worker")
         crawler.start_crawling(DataSourceConfig.WIKIPEDIA_SEEDS)
+        
+        # Wait a bit for crawler to initialize and start collecting data
+        time.sleep(2)
         
         # Initialize trainer
         trainer = UnifiedTrainer(
@@ -100,115 +109,161 @@ def training_worker(model, optimizer, device, distributed, local_rank, stop_even
         # Training loop
         num_epochs = 30
         min_batch_size = 8
+        max_batch_size = 32
         last_save_time = time.time()
         save_interval = 300  # Save every 5 minutes
+        data_collection_timeout = 60  # Wait up to 60 seconds for data
+        max_collection_retries = 10  # Maximum number of times to retry collecting data
+        
+        # Data buffers for batching
+        text_buffer = []
+        image_buffer = []
         
         for epoch in range(start_epoch, num_epochs):
             if stop_event.is_set():
+                logging.info("Stop event received, saving checkpoint and stopping...")
                 break
             
-            # Get data from crawler queues and process
-            text_data = []
-            image_data = []
+            epoch_start_time = time.time()
+            batches_processed = 0
+            total_loss = 0
+            collection_retries = 0
             
-            # Try to collect enough data for a batch
-            while len(text_data) < min_batch_size and not crawler.text_queue.empty():
-                try:
-                    item = crawler.text_queue.get(timeout=1)
-                    if item and item['text'] and len(item['text'].split()) > 50:
-                        text_data.append(item['text'])
-                except queue.Empty:
+            # Collect and process data throughout the epoch
+            while time.time() - epoch_start_time < 3600:  # Run epoch for max 1 hour
+                if stop_event.is_set():
                     break
-                except Exception as e:
-                    logging.error(f"Error processing text data: {e}")
-                    continue
-            
-            while len(image_data) < min_batch_size and not crawler.image_queue.empty():
-                try:
-                    item = crawler.image_queue.get(timeout=1)
-                    if item and item.get('image'):
-                        image_data.append(item['image'])
-                except queue.Empty:
-                    break
-                except Exception as e:
-                    logging.error(f"Error processing image data: {e}")
-                    continue
-            
-            # Create dataset and loaders if we have enough data
-            if len(text_data) >= min_batch_size and len(image_data) >= min_batch_size:
-                # Ensure equal lengths by truncating to shorter list
-                min_len = min(len(text_data), len(image_data))
-                text_data = text_data[:min_len]
-                image_data = image_data[:min_len]
                 
-                try:
-                    dataset = MultiModalDataset(text_data, image_data)
-                    train_loader = data_processor.get_train_loader(dataset, batch_size=min_batch_size)
-                    val_loader = data_processor.get_val_loader(dataset, batch_size=min_batch_size)
+                # Check if crawler is still running
+                if not crawler.is_running or not crawler.thread_pool.is_alive():
+                    logging.error("Crawler stopped unexpectedly, restarting...")
+                    crawler.stop()
+                    crawler = DFSWebCrawler(cache_dir='./crawler_cache')
+                    crawler.visited = set()  # Start fresh
+                    crawler.start_crawling(DataSourceConfig.WIKIPEDIA_SEEDS)
+                    time.sleep(2)  # Wait for crawler to initialize
+                    collection_retries = 0
+                    continue
+                
+                # Try to collect data for a batch
+                collection_start = time.time()
+                data_collected = False
+                
+                while len(text_buffer) < max_batch_size and len(image_buffer) < max_batch_size:
+                    if time.time() - collection_start > data_collection_timeout:
+                        break
                     
-                    # Train epoch
-                    train_loss = trainer.train_epoch(train_loader, epoch)
-                    val_loss = trainer.validate(val_loader)
+                    # Get text data
+                    try:
+                        while not crawler.text_queue.empty() and len(text_buffer) < max_batch_size:
+                            item = crawler.text_queue.get_nowait()
+                            if item and item['text'] and len(item['text'].split()) > 50:
+                                text_buffer.append(item['text'])
+                                data_collected = True
+                    except queue.Empty:
+                        pass
                     
-                    logging.info(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                    # Get image data
+                    try:
+                        while not crawler.image_queue.empty() and len(image_buffer) < max_batch_size:
+                            item = crawler.image_queue.get_nowait()
+                            if item and item.get('image'):
+                                image_buffer.append(item['image'])
+                                data_collected = True
+                    except queue.Empty:
+                        pass
                     
-                    # Save checkpoint periodically
-                    current_time = time.time()
-                    if current_time - last_save_time >= save_interval:
-                        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}_{current_time:.0f}.pt')
-                        checkpoint = {
-                            'epoch': epoch + 1,  # Save next epoch to resume from
-                            'model_state_dict': model.state_dict() if not distributed else model.module.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'train_loss': train_loss,
-                            'val_loss': val_loss,
-                            'best_val_loss': best_val_loss,
-                            'visited_urls': list(crawler.visited),
-                            'timestamp': current_time
-                        }
-                        torch.save(checkpoint, checkpoint_path)
-                        logging.info(f"Saved checkpoint to {checkpoint_path}")
-                        last_save_time = current_time
+                    if len(text_buffer) < min_batch_size or len(image_buffer) < min_batch_size:
+                        time.sleep(0.1)  # Short sleep to prevent CPU spinning
+                
+                if not data_collected:
+                    collection_retries += 1
+                    if collection_retries >= max_collection_retries:
+                        logging.warning("No data collected after maximum retries, restarting crawler...")
+                        crawler.stop()
+                        crawler = DFSWebCrawler(cache_dir='./crawler_cache')
+                        crawler.visited = set()  # Start fresh
+                        crawler.start_crawling(DataSourceConfig.WIKIPEDIA_SEEDS)
+                        time.sleep(2)  # Wait for crawler to initialize
+                        collection_retries = 0
+                        continue
+                else:
+                    collection_retries = 0
+                
+                # Process batch if we have enough data
+                if len(text_buffer) >= min_batch_size and len(image_buffer) >= min_batch_size:
+                    try:
+                        # Take batch_size items from buffers
+                        batch_size = min(len(text_buffer), len(image_buffer), max_batch_size)
+                        batch_texts = text_buffer[:batch_size]
+                        batch_images = image_buffer[:batch_size]
                         
-                        # Clean up old checkpoints (keep last 5)
-                        checkpoint_files = sorted(os.listdir(checkpoint_dir))
-                        if len(checkpoint_files) > 5:
-                            for old_checkpoint in checkpoint_files[:-5]:
-                                os.remove(os.path.join(checkpoint_dir, old_checkpoint))
+                        # Remove used items from buffers
+                        text_buffer = text_buffer[batch_size:]
+                        image_buffer = image_buffer[batch_size:]
+                        
+                        # Create dataset and loaders
+                        dataset = MultiModalDataset(batch_texts, batch_images)
+                        train_loader = data_processor.get_train_loader(dataset, batch_size=batch_size)
+                        val_loader = data_processor.get_val_loader(dataset, batch_size=batch_size)
+                        
+                        # Train on batch
+                        train_loss = trainer.train_epoch(train_loader, epoch)
+                        val_loss = trainer.validate(val_loader)
+                        
+                        total_loss += train_loss
+                        batches_processed += 1
+                        
+                        # Log progress
+                        if batches_processed % 10 == 0:
+                            avg_loss = total_loss / batches_processed
+                            logging.info(
+                                f"Epoch {epoch} - Batch {batches_processed}: "
+                                f"Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, "
+                                f"Avg Loss = {avg_loss:.4f}"
+                            )
+                        
+                        # Save checkpoint periodically
+                        current_time = time.time()
+                        if current_time - last_save_time >= save_interval:
+                            save_checkpoint(
+                                checkpoint_dir, epoch, model, optimizer,
+                                train_loss, val_loss, best_val_loss,
+                                crawler, current_time, distributed
+                            )
+                            last_save_time = current_time
+                        
+                        # Update best model if needed
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            save_best_model(
+                                model_dir, epoch, model, optimizer,
+                                train_loss, val_loss, best_val_loss,
+                                crawler, current_time, distributed
+                            )
                     
-                    # Save best model
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        model_path = os.path.join(model_dir, 'best_model.pt')
-                        best_checkpoint = {
-                            'epoch': epoch + 1,
-                            'model_state_dict': model.state_dict() if not distributed else model.module.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'train_loss': train_loss,
-                            'val_loss': val_loss,
-                            'best_val_loss': best_val_loss,
-                            'visited_urls': list(crawler.visited),
-                            'timestamp': current_time
-                        }
-                        torch.save(best_checkpoint, model_path)
-                        logging.info(f"Saved best model with validation loss {val_loss:.4f}")
+                    except Exception as e:
+                        logging.error(f"Error processing batch: {e}")
+                        continue
                 
-                except Exception as e:
-                    logging.error(f"Error during training: {e}")
-                    continue
+                else:
+                    # Get crawler metrics to help diagnose issues
+                    metrics = crawler.get_enhanced_metrics()
+                    logging.info(
+                        f"Epoch {epoch}: Waiting for data... "
+                        f"(text buffer: {len(text_buffer)}, image buffer: {len(image_buffer)}) "
+                        f"Pages crawled: {metrics['pages_crawled']}, "
+                        f"Crawl rate: {metrics['crawl_rate']:.2f} pages/sec, "
+                        f"Cache hits: {metrics['cache_hits']}, "
+                        f"Success rate: {metrics['success_rate']:.2%}, "
+                        f"Collection retries: {collection_retries}"
+                    )
+                    time.sleep(1)  # Wait a bit before checking again
             
-            else:
-                # Get crawler metrics to help diagnose issues
-                metrics = crawler.get_enhanced_metrics()
-                logging.info(
-                    f"Epoch {epoch}: Waiting for data from crawler... "
-                    f"(text: {len(text_data)}, images: {len(image_data)}) "
-                    f"Pages crawled: {metrics['pages_crawled']}, "
-                    f"Crawl rate: {metrics['crawl_rate']:.2f} pages/sec, "
-                    f"Cache hits: {metrics['cache_hits']}, "
-                    f"Success rate: {metrics['success_rate']:.2%}"
-                )
-                time.sleep(1)  # Wait a bit before checking again
+            # End of epoch logging
+            if batches_processed > 0:
+                epoch_loss = total_loss / batches_processed
+                logging.info(f"Epoch {epoch} completed - Average loss: {epoch_loss:.4f}")
     
     except Exception as e:
         logging.error(f"Error in training loop: {e}")
@@ -225,7 +280,7 @@ def training_worker(model, optimizer, device, distributed, local_rank, stop_even
                 'train_loss': train_loss if 'train_loss' in locals() else None,
                 'val_loss': val_loss if 'val_loss' in locals() else None,
                 'best_val_loss': best_val_loss,
-                'visited_urls': list(crawler.visited),
+                'visited_urls': list(crawler.visited) if crawler else [],
                 'timestamp': time.time()
             }
             torch.save(final_checkpoint, final_checkpoint_path)
@@ -233,20 +288,66 @@ def training_worker(model, optimizer, device, distributed, local_rank, stop_even
         except Exception as e:
             logging.error(f"Error saving final checkpoint: {e}")
         
-        logging.info("Stopping crawler from training worker")
-        crawler.stop()
+        # Stop crawler gracefully
+        if crawler:
+            try:
+                logging.info("Stopping crawler from training worker")
+                crawler.stop()
+            except Exception as e:
+                logging.error(f"Error stopping crawler: {e}")
+
+def save_checkpoint(checkpoint_dir, epoch, model, optimizer, train_loss, val_loss, best_val_loss, crawler, timestamp, distributed):
+    """Save a training checkpoint"""
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}_{timestamp:.0f}.pt')
+    checkpoint = {
+        'epoch': epoch + 1,
+        'model_state_dict': model.state_dict() if not distributed else model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'visited_urls': list(crawler.visited),
+        'timestamp': timestamp
+    }
+    torch.save(checkpoint, checkpoint_path)
+    logging.info(f"Saved checkpoint to {checkpoint_path}")
+    
+    # Clean up old checkpoints (keep last 5)
+    checkpoint_files = sorted(os.listdir(checkpoint_dir))
+    if len(checkpoint_files) > 5:
+        for old_checkpoint in checkpoint_files[:-5]:
+            os.remove(os.path.join(checkpoint_dir, old_checkpoint))
+
+def save_best_model(model_dir, epoch, model, optimizer, train_loss, val_loss, best_val_loss, crawler, timestamp, distributed):
+    """Save the best model"""
+    model_path = os.path.join(model_dir, 'best_model.pt')
+    best_checkpoint = {
+        'epoch': epoch + 1,
+        'model_state_dict': model.state_dict() if not distributed else model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'visited_urls': list(crawler.visited),
+        'timestamp': timestamp
+    }
+    torch.save(best_checkpoint, model_path)
+    logging.info(f"Saved best model with validation loss {val_loss:.4f}")
 
 def main():
     # Check CUDA availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    distributed = torch.cuda.device_count() > 1
+    distributed = False  # Only enable distributed if CUDA is available
     local_rank = 0
     
-    if distributed:
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        distributed = True
         torch.distributed.init_process_group(backend='nccl')
         local_rank = torch.distributed.get_rank()
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
+    
+    logging.info(f"Using device: {device} (Distributed: {distributed})")
     
     # Initialize configuration
     model_config = ModelConfig()
@@ -264,8 +365,9 @@ def main():
     if distributed:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
-    # Initialize optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    # Initialize optimizer with lower learning rate for CPU
+    lr = 1e-4 if torch.cuda.is_available() else 5e-5
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     # Create stop event for graceful shutdown
     stop_event = threading.Event()

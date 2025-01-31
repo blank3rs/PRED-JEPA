@@ -25,7 +25,7 @@ class UnifiedTrainer:
         self.device = device
         self.distributed = distributed
         self.local_rank = local_rank
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
         
         # Initialize distributed training if needed
         if distributed:
