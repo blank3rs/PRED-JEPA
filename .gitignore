@@ -196,7 +196,7 @@ secrets/
 jepa.log
 
 # Model files
-models/
+# Keep .py files but ignore model weights and checkpoints
 *.pt
 *.pth
 *.onnx
@@ -210,6 +210,5 @@ models/
 *.tflite
 *.mlmodel
 *.safetensors
-**/models/
 model_weights/
 pretrained/
